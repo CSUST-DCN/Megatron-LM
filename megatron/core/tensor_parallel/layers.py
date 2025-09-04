@@ -12,11 +12,27 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+
+##add
+import io
+import math
+import torch.nn.init as init
+from torch.cuda.amp import custom_bwd, custom_fwd
+##add
+mode = "tensor" # channel_tensor  tensor  tile_block channel tile
+sr = True
+int8_pad = True
+clamp_outlier = False #False  #if gpc.config.clamp_outlier:
+
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
     get_global_memory_buffer,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    ##add
+    # get_tensor_and_expert_parallel_rank,
+    # get_tensor_and_expert_parallel_world_size,
+    # get_tensor_model_parallel_group,
 )
 from megatron.core.utils import (
     divide,
@@ -30,6 +46,8 @@ from megatron.core.utils import (
 
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
+##add
+from ..utils import make_tp_sharded_tensor_for_checkpoint, prepare_input_tensors_for_wgrad_compute
 from .mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
@@ -40,6 +58,52 @@ from .mappings import (
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility
+##add
+# from .int8 import per_row_quantize_int8, per_col_quantize_int8, per_tensor_quantize_int8, per_token_scaled_int8_mm
+
+# from .int8copy import (
+#     per_block_quantize_int8,
+#     per_block_scaled_int8_mm,
+#     per_col_quantize_int8,
+#     per_group_col_quantize_int8,
+#     per_group_row_quantize_int8,
+#     # per_group_scaled_int8_mm,
+#     per_row_quantize_int8,
+#     # per_rowgroup_block_scaled_int8_mm,
+#     per_tensor_quantize_int8,
+#     per_tensor_scaled_int8_mm,
+#     per_tensor_token_scaled_int8_mm,
+#     per_token_tensor_scaled_int8_mm,
+#     clamp_outliers,
+#     _select_int8_ops,
+#     _quantize_int8,
+#     int8_gemm,
+# )
+
+
+from .int8 import (
+    per_block_quantize_int8,
+    per_block_scaled_int8_mm,
+    per_col_quantize_int8,
+    per_group_col_quantize_int8,
+    per_group_row_quantize_int8,
+    per_group_scaled_int8_mm,
+    per_row_quantize_int8,
+    per_rowgroup_block_scaled_int8_mm,
+    per_tensor_quantize_int8,
+    per_tensor_scaled_int8_mm,
+    per_tensor_token_scaled_int8_mm,
+    per_token_tensor_scaled_int8_mm,
+    clamp_outliers,
+    _select_int8_ops,
+    _quantize_int8,
+    _torch_linear_forward_op,
+)
+
+
+# import per_row_quantize_int8, per_col_quantize_int8, per_tensor_quantize_int8, per_token_scaled_int8_mm
+
+
 
 _grad_accum_fusion_available = True
 try:
@@ -291,7 +355,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             # Reduce across all the model parallel GPUs.
             output = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
-        return output
+        return output.clone()
 
     def sharded_state_dict(
         self,
@@ -332,7 +396,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         output = torch.matmul(input, weight.t())
         if bias is not None:
             output = output + bias
-        return output
+        return output.clone()
 
     @staticmethod
     @custom_bwd
@@ -345,7 +409,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
             # All-reduce. Note: here async and sync are effectively the same.
             torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
 
-        return grad_input, None, None, None, None
+        return grad_input.clone(), None, None, None, None
 
 
 def linear_with_frozen_weight(
@@ -425,7 +489,13 @@ def linear_with_frozen_weight(
         )
     else:
         input = input
-
+##add
+    if allreduce_dgrad is None:
+        warnings.warn(
+            "async_grad_allreduce is deprecated and will be removed in a future release. use allreduce_dgrad instead."
+        )
+        allreduce_dgrad = async_grad_allreduce
+##add
     args = [input, weight, bias, allreduce_dgrad, tp_group]
 
     return LinearWithFrozenWeight.apply(*args)
@@ -449,6 +519,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         tp_group,
     ):
         """Forward."""
+        # gradient_accumulation_fusion = False ##lyadd
         if gradient_accumulation_fusion and hasattr(weight, "main_grad"):
             main_grad = weight.main_grad
         else:
@@ -466,6 +537,9 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         ctx.grad_output_buffer = grad_output_buffer
         ctx.tp_group = tp_group
 
+        # if os.getenv("USR_INT8_QUANT", "0") == "1":
+        #     assert not sequence_parallel, "not support sequence parallel"
+
         if sequence_parallel:
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * tp_group.size()
@@ -473,19 +547,75 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
             dist_all_gather_func(all_gather_buffer, input, group=tp_group)
             total_input = all_gather_buffer
+            # _input = all_gather_buffer
         else:
             total_input = input
+            # _input = input
+##add
+        # print(f"total_input shape: {total_input.shape}, weight shape: {weight.shape}")
+        
+        # export USR_INT8_QUANT=1
+        if os.getenv("USR_INT8_QUANT", "0") == "1":
+            ##add date 8-3
+            dtype = total_input.dtype
+            org_shape = total_input.shape
+            # print(_input.shape)
+            total_input = total_input.reshape(-1, org_shape[-1])
+            # print(11111111111111)
+            # print(_input.shape)
+            # print(weight.shape)
+            # print(weight.t().shape)
+            # grad_output = grad_output.reshape(-1, org_shape[-1])
+            #mode = gpc.config.int8_mode
+            # mode = "channel_tensor" # channel_tensor  tensor  tile_block
+            # int8_pad = True
+            # clamp_outlier = True  #if gpc.config.clamp_outlier:
+            # # _input = total_input
+            if clamp_outlier:
+                input_name = getattr(total_input, "global_name", None)
+                total_input, total_input_outliers = clamp_outliers(total_input)
+                if input_name is not None:
+                    setattr(total_input, "global_name", input_name)
 
-        output = torch.matmul(total_input, weight.t())
+            _, _, int8_mm = _select_int8_ops(mode)
+            _input_int8, weight_t_int8, input_scale, weight_t_scale = _quantize_int8(total_input, weight, sr=sr, mode=mode)
+            assert _input_int8.dtype == torch.int8 and weight_t_int8.dtype == torch.int8
+            output = int8_mm(_input_int8, weight_t_int8, input_scale, weight_t_scale).to(dtype)
+
+            if clamp_outlier:
+                outlier_output = _torch_linear_forward_op(total_input_outliers, weight)
+                # outlier_output = torch.matmul(total_input_outliers, weight.t())
+                output += outlier_output
+
+            if int8_pad:
+                m, _ = total_input.shape
+                _, n = weight.t().shape
+                output = output[:m, :n]            
+
+            # dtype = total_input.dtype
+            # org_shape = total_input.shape
+            # total_input = total_input.reshape(-1, org_shape[-1])
+            # total_input, total_input_scale = per_row_quantize_int8(total_input)
+            # weight_t, weight_scale_t = per_tensor_quantize_int8(weight.t())
+            # output = per_token_scaled_int8_mm(total_input, weight_t, total_input_scale, weight_scale_t, dtype)
+            # print(_input.shape)
+            output = output.view(org_shape[0], org_shape[1], weight_t_int8.shape[1])
+            # print(222222222222222222)
+            # print(_input.shape)
+
+ 
+        else:##add
+            output = torch.matmul(total_input, weight.t())
         if bias is not None:
             output = output + bias
-        return output
+        return output.clone()
 
     @staticmethod
     @custom_bwd
     def backward(ctx, grad_output):
         """Backward."""
         input, weight = ctx.saved_tensors
+        dtype = grad_output.dtype ##add
         main_grad = ctx.main_grad
         use_bias = ctx.use_bias
         grad_output_buffer = ctx.grad_output_buffer
@@ -517,9 +647,80 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
                 # gather is scheduled before the input gradient computation
                 total_input = all_gather_buffer
+                # _input = all_gather_buffer
             else:
                 total_input = input
-        grad_input = grad_output.matmul(weight)
+                # _input = input
+##add
+        if os.getenv("USR_INT8_QUANT", "0") == "1":
+            ##add date 8-3
+            dtype = total_input.dtype
+            # input_shape = total_input.shape
+            org_shape = grad_output.shape
+            # print(111111111111111)
+            # print(_input.dim())
+            # total_input = total_input.reshape(-1, input_shape[-1])  ###注释掉好像会报错
+            grad_output = grad_output.reshape(-1, org_shape[-1])
+            # print(222222222222222)
+            # print(_input.dim())
+            # print(total_input.shape)
+            # print(grad_output.shape)
+
+            # org_shape = _input.shape
+            #mode = gpc.config.int8_mode
+            # mode = "channel_tensor" # channel_tensor  tensor  tile_block
+            # int8_pad = True
+            # clamp_outlier = True  #if gpc.config.clamp_outlier:
+            # # _input = total_input
+            if clamp_outlier:
+                input_name = getattr(grad_output, "global_name", None)
+                grad_output, grad_output_outliers = clamp_outliers(grad_output)
+                if input_name is not None:
+                    setattr(grad_output, "global_name", input_name)
+
+            # if clamp_outlier:
+            #     input_name = getattr(weight, "global_name", None)
+            #     weight, weight_outliers = clamp_outliers(weight)
+            #     if input_name is not None:
+            #         setattr(weight, "global_name", input_name)
+
+            _, _, int8_mm = _select_int8_ops(mode)
+
+
+            # grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale = _quantize_int8(
+            #     grad_output.t(), _input, mode=mode, trans_b=False
+            # )             ####是否这里grad_output不需要转置
+            grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale = _quantize_int8(
+                grad_output, weight, sr=sr, mode=mode, trans_b=False
+            )
+            assert _input_int8.dtype == torch.int8 and grad_output_t_int8.dtype == torch.int8
+            # grad_weight = int8_mm(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+            grad_input = int8_mm(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+
+            if clamp_outlier:
+                outlier_output = torch.matmul(grad_output_outliers, weight)
+                grad_input += outlier_output
+
+            if int8_pad:
+                m, _ = grad_output.shape
+                _, n = weight.shape
+                grad_input = grad_input[:m, :n]
+
+
+            # org_shape = grad_output.shape
+            # grad_output = grad_output.reshape(-1, org_shape[-1])
+            # grad_output_r, grad_output_scale_r = per_row_quantize_int8(grad_output)
+            # # weight, weight_scale = per_col_quantize_int8(weight)
+            # weight, weight_scale = per_tensor_quantize_int8(weight)
+            # grad_input = per_token_scaled_int8_mm(grad_output_r, weight, grad_output_scale_r, weight_scale, torch.float32)
+            # print(33333333333333)
+            # print(grad_weight.shape)
+            grad_input = grad_input.view(org_shape[0], org_shape[1], _input_int8.shape[1])
+            # print(44444444444444)
+            # print(grad_input.shape)
+        
+        else:##add
+            grad_input = grad_output.matmul(weight)
 
         if ctx.sequence_parallel and wgrad_compute:
             # pylint: disable=possibly-used-before-assignment
@@ -585,7 +786,58 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             else:
                 grad_weight = None
         else:
-            grad_weight = grad_output.t().matmul(total_input)
+##add
+            if os.getenv("USR_INT8_QUANT", "0") == "1":
+                # grad_output_t, grad_output_scale_t = per_row_quantize_int8(grad_output.t())
+                # total_input_c, total_input_scale_c = per_col_quantize_int8(total_input.reshape(-1, total_input.shape[-1]))
+                # grad_weight = per_token_scaled_int8_mm(grad_output_t, total_input_c, grad_output_scale_t, total_input_scale_c, dtype)
+            
+            
+            
+                ##add date 8-3
+                dtype = total_input.dtype
+                input_shape = total_input.shape
+                org_shape = grad_output.shape
+                total_input = total_input.reshape(-1, input_shape[-1])
+                # grad_output = grad_output.reshape(-1, org_shape[-1])
+                #mode = gpc.config.int8_mode
+                # mode = "channel_tensor" # channel_tensor  tensor  tile_block
+                # int8_pad = True 
+                # clamp_outlier = True  #if gpc.config.clamp_outlier:
+                # # _input = total_input
+                if clamp_outlier:
+                    input_name = getattr(total_input, "global_name", None)
+                    total_input, total_input_outliers = clamp_outliers(total_input)
+                    if input_name is not None:
+                        setattr(total_input, "global_name", input_name)
+
+                _, _, int8_mm = _select_int8_ops(mode)
+                grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale = _quantize_int8(
+                    grad_output.t(), total_input, sr=sr, mode=mode, trans_b=False
+                )
+                assert _input_int8.dtype == torch.int8 and grad_output_t_int8.dtype == torch.int8
+                grad_weight = int8_mm(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+
+                # _input_int8, weight_t_int8, input_scale, weight_t_scale = _quantize_int8(_input, weight, mode=mode)
+                # assert _input_int8.dtype == torch.int8 and weight_t_int8.dtype == torch.int8
+                # output = int8_mm(_input_int8, weight_t_int8, input_scale, weight_t_scale).to(dtype)
+
+                if clamp_outlier:
+                    outlier_output = torch.matmul(grad_output.t(), total_input_outliers)
+                    grad_weight += outlier_output
+
+                if int8_pad:
+                    m, _ = grad_output.t().shape
+                    _, n = total_input.shape
+                    grad_weight = grad_weight[:m, :n]
+            
+                # grad_weight = grad_weight.view(org_shape[0], org_shape[1], _input_int8.shape[1])
+
+
+
+            
+            else:##add
+                grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
         if ctx.sequence_parallel:
@@ -597,7 +849,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.allreduce_dgrad:
             handle.wait()
 
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
+        return grad_input.clone(), grad_weight.clone(), grad_bias, None, None, None, None, None, None
 
 
 def linear_with_grad_accumulation_and_async_allreduce(
@@ -894,7 +1146,6 @@ class ColumnParallelLinear(torch.nn.Module):
         self.allreduce_dgrad = (
             world_size > 1 and not self.sequence_parallel and not self.disable_grad_reduce
         )
-
         if config.gradient_accumulation_fusion and not _grad_accum_fusion_available:
             raise RuntimeError(
                 "ColumnParallelLinear was called with gradient_accumulation_fusion set "
@@ -957,7 +1208,13 @@ class ColumnParallelLinear(torch.nn.Module):
                     f"supplied weight's shape is {tuple(weight.shape)}, "
                     f"not {expected_shape} as expected"
                 )
-
+##add
+        if self.config._cpu_offloading_context is not None:
+            if self.config._cpu_offloading_context.inside_context == True:
+                assert (
+                    self.config.cpu_offloading == False
+                ), "CPU Offloading cannot be enabled while using non-TE modules"
+##add
         bias = self.bias if not self.skip_bias_add else None
 
         if (
@@ -1023,7 +1280,7 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
+        return output.clone(), output_bias
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
@@ -1240,6 +1497,7 @@ class RowParallelLinear(torch.nn.Module):
             weight=self.weight,
             bias=None,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
+            async_grad_allreduce=allreduce_dgrad,##add
             allreduce_dgrad=allreduce_dgrad,
             sequence_parallel=False,
             tp_group=None,
@@ -1262,7 +1520,7 @@ class RowParallelLinear(torch.nn.Module):
         else:
             output = output_
             output_bias = self.bias
-        return output, output_bias
+        return output.clone(), output_bias
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""
