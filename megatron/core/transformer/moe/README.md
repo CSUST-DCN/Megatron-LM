@@ -5,10 +5,15 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
 ### What's New
 - **Support for DeepSeek-V3 architecture**
   - Enable TP for MLA and DeepSeek-V3
+  - Enable CP for MLA and DeepSeek-V3
+    - Requires TransformerEngine >= 2.5.0
+    - Many thanks to [SuperCB](https://github.com/SuperCB) from Xiaohongshu Inc. and [RandMist](https://github.com/RandMist) from WeChat Infra Department, Tencent Inc. for their contributions.
   - Support aux-loss-free load balancing strategy
   - Support node-limited routing
   - Support Multi-Token Prediction (MTP)
+  - Batch-level overlapping to hide EP-A2A communication
 - **Support DeepSeek's DeepEP for efficient token dispatching and combining**
+- Support HybridEP for efficient token dispatching and combining within intra-node and MNNVL scenarios.
 - Add fusion for token permutation and unpermutation
 - Support Uneven virtual pipeline parallel split
 - Support output-discarding checkpointing on some submodules
@@ -31,6 +36,7 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
     - Sinkhorn (S-BASE)
     - Aux loss / Load balancing loss
     - Aux-loss-free load balancing strategy
+- CUDA fused routing and load balancing kernels
 
 ### Performance Optimizations
 - (Experimental) **DeepEP** is integrated for efficient token communication in large-scale MoE training.
@@ -51,10 +57,6 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
 - Distributed checkpoining
 - Per-layer logging
 - Upcycling Support
-
-## Upcoming features
-- TopK Router Fusion
-- Multi-token Prediction
 
 # User Guide
 
@@ -171,19 +173,42 @@ Note: The MoE model structure is defined through script arguments. All MoE-relat
 ### Leverage DeepSeek's DeepEP for High-Performance Cross-Node Token Dispatching
 - [DeepSeek-DeepEP](https://github.com/deepseek-ai/deepep) provides a highly optimized implementation for MoE token dispatching and combining operations, specifically designed for large-scale MoE training scenarios.
 - DeepEP is particularly recommended for training large-scale, fine-grained MoE architectures such as DeepSeek-V3 and other advanced MoE models.
-- To enable DeepEP in your training configuration, simply set `--moe-token-dispatcher-type=flex` and `--moe-enable-deepep` in your command line arguments.
+- To enable DeepEP in your training configuration, simply set `--moe-token-dispatcher-type=flex` and `--moe-flex-dispatcher-backend=deepep` in your command line arguments.
+
+### Integrate HybridEP for High-Performance Intra-Node Token Dispatching
+- [HybridEP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) is developed by NVIDIA as an optimized solution for large-scale MoE (Mixture of Experts) all-to-all communication. It is designed to leverage NVIDIA GPU hardware capabilities, significantly reducing Streaming Multiprocessor (SM) resource usage.
+- HybridEP currently supports intra-node and multi-node NVLink scenarios.
+- To enable HybridEP, set `--moe-token-dispatcher-type=flex` and
+  `--moe-flex-dispatcher-backend=hybridep` in your command line arguments.
 
 ### CUDA Graph Support
-CUDA Graph functionality can be enabled through two options:
+CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are two implementations:
 
-1. `--enable-cuda-graph`: Automatically captures graphs during runtime (just-in-time)
-2. `--external-cuda-graph`: Requires manual graph capture before runtime (ahead-of-time)
+1. `--cuda-graph-impl=local`: Captures cuda graphs using the MCore-internal cuda graph manager.
+2. `--cuda-graph-impl=transformer_engine`: Captures cuda graphs using the TE `make_graphed_callables()` interface.
 
-Note: These two options cannot be enabled simultaneously.
+To use `--cuda-graph-impl=transformer_engine`, the user should call related methods `TECudaGraphHelper.create_cudagraphs()` and `TECudaGraphHelper.cuda_graph_set_manual_hooks()` in the training script. Please refer to the usage in `megatron/training/training.py`.
 
-For manual capture with `--external-cuda-graph`, refer to the `cuda_graph_capture()` and `cuda_graph_set_manual_hooks()` functions in `megatron/training/training.py`.
+For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for the attention layers (operations in `TransformerLayer._forward_attention()`) by setting `--cuda-graph-scope=attn`, while leaving the MoE layers (operations in `TransformerLayer._forward_mlp()`) unmodified. See the argument description for more usage of `--cuda-graph-scope`.
 
-For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for attention layers by setting `--cuda-graph-scope=attn`, while leaving MoE layers unmodified. Note that the `--cuda-graph-scope` parameter is only applicable when using `--external-cuda-graph` mode.
+
+### Batch-Level EP-A2A hidding
+Enable A2A overlap across different batches inspired by the DSv3 DualPipe implmentation. \
+**Features** 
+- Hide ep a2a communication by batch-level overlapping
+- Split weight gradient and activation gradient computations for better overlap with communications
+- Support interleaved pipelined parallelism
+- Support FP8 training
+- Support MTP (`-mtp-num-layers 1` only, multiple MTP layers are not supported yet.)
+
+
+**Usage** 
+```bash
+# Add the following flags to your training scripts
+--overlap-moe-expert-parallel-comm
+# [optional] only works with specific TE version
+--delay-wgrad-compute
+```
 
 ### MoE Related Arguments
 | Item | Description |
@@ -212,14 +237,15 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-group-topk | Number of selected groups for group-limited routing. |
 | --moe-router-topk-scaling-factor | Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling. |
 | --moe-router-enable-expert-bias | TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy. The routing decision is based on the sum of the routing scores and the expert bias. See https://arxiv.org/abs/2408.15664 for details. |
+| --moe-router-fusion | Enable fusion for MoE TopK routing and aux-loss computation. This is only supported in TransformerEngine 2.7.0 and above. |
 | --moe-router-bias-update-rate | The expert bias is updated based on the number of assigned tokens to each expert in a global batch, where the bias is increased for experts with less assigned tokens and decreased for experts with more assigned tokens. Default is 1e-3 same as that used in DeepSeekV3. |
 | --moe-router-force-load-balancing | (Experimental) Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only! |
-| --moe-router-padding-for-fp8 | Pad the routing_map to make sure the number of tokens each expert received is a multiple of 16/32 for FP8 precision. It is suggested to enable this for dropless training with FP8 precision when num_local_experts > 1. This is a more efficient way to pad for FP8 which eliminates the explicit padding in the GroupedMLP layer. |
+| --moe-router-padding-for-quantization | Pad the routing_map to make sure the number of tokens each expert received is a multiple of 16/32 for FP8/FP4 precision. It is suggested to enable this for dropless training with FP8 precision when num_local_experts > 1. This is a more efficient way to pad for FP8 which eliminates the explicit padding in the GroupedMLP layer. |
 | --moe-aux-loss-coeff | Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended. Default is 0.0. |
 | --moe-z-loss-coeff | Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended. Default is None. |
 | --moe-input-jitter-eps | Add noise to the input tensor by applying jitter with a specified epsilon value. Default is None. |
 | --moe-token-dispatcher-type | Determines the token dispatcher type. Choices are "allgather", "alltoall". Default is "allgather". We recommend using 'alltoall' if expert parallelism is applied. We have upgraded the "alltoall" dispatcher in place during MCore v0.9, while the original implementation renamed as "alltoall_seq" is retained until MCore v0.13.|
-| --moe-enable-deepep | (Experimental) Enable DeepSeek/DeepEP for efficient token dispatching and combine in MoE models. Only works with flex token dispatcher by setting --moe-token-dispatcher-type=flex. |
+| --moe-flex-dispatcher-backend | (Experimental) Select the backend for the flex token dispatcher. Supported options: "deepep", "hybridep". Enables efficient token dispatching and combining for MoE models. |
 | --moe-per-layer-logging | Enable per-layer logging for MoE, currently supports auxiliary loss and z loss. |
 | --moe-expert-capacity-factor | The capacity factor for each expert, None means no token will be dropped. Default is None. |
 | --moe-pad-expert-input-to-capacity | Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set. |
@@ -229,6 +255,8 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-shared-expert-intermediate-size | Set shared expert total ffn hidden size. It should be equal to `num_shared_experts * ffn_size_of_each_shared_expert` if there are multiple shared experts. None means no shared expert. |
 | --moe-shared-expert-overlap | (Experimental, may change) If this is set, the communications/computations in the shared experts and the dispatcher will overlap (The `alltoall` dispatcher is needed.) Otherwise, the shared expert runs after the routed experts. |
 | --moe-use-upcycling | Load the dense model checkpoint, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.|
+| --overlap-moe-expert-parallel-comm | Enable batch-level overlapping in 1f1b stage. |
+| --delay-wgrad-compute | Enable split dgrad and wgrad for `overlap-moe-expert-parallel-comm` execution. Increasing room to hide communication latency by more finegrained control. |
 | --pipeline-model-parallel-layout | (Experimental, may change) A string containing a Python list expression that defines a custom pipeline model parallel layout. |
 | --moe-upcycling-granularity | This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.|
 
@@ -418,7 +446,7 @@ By setting `--expert-tensor-parallel-size`, we can set MoE-specific TP size.
 - Token Dispatcher sends tokens to the designated expert, involves tensor rearangement and communications.
 - Dispatcher `allgather` is the default option. It achieves better performance and efficiency when only tensor parallelism is used or when the Top-k value is very large.
 - Dispatcher `alltoall` is recommended if expert parallelism is applied.
-- Dispatcher `flex` is a new dispatcher decouples communication group from model parallelism. Currently, only the DeepEP backend is supported for by setting `--moe-enable-deepep`.
+- Dispatcher `flex` is a new dispatcher decouples communication group from model parallelism. It supports two backends(DeepEP and HybridEP) selectable via `--moe-flex-dispatcher-backend`.
 
 **Enable Communication Overlap**
 - Enable `--overlap-param-gather` and `--overlap-grad-reduce` with distributed optimizer.
@@ -441,7 +469,7 @@ Therefore, there are two recommended ways during the first 200 steps to avoid th
 
 **FP8 Training Best Practice**
 - Using latest version of [TransformerEngine](https://github.com/NVIDIA/TransformerEngine).
-- Enable router padding with `--moe-router-padding-for-fp8` to reduce padding overhead.
+- Enable router padding with `--moe-router-padding-for-quantization` to reduce padding overhead.
 - Enable native FP8 weights with `--fp8-param-gather` to reduce weights memory cost.
 
 ### Reference Best Parallel Mapping

@@ -131,10 +131,7 @@ class KitchenQuantizationParams:
     def parse_from_config(quant_config: QuantizationConfig) -> "KitchenQuantizationParams":
         """Parses quantization config for a layer or throw an error."""
         if not HAVE_KITCHEN:
-            raise ImportError(
-                "Kitchen extension requires the nvidia_kitchen package. "
-                "Please install it with `pip install nvidia-kitchen`."
-            )
+            raise ImportError("Kitchen not available. Kitchen is not released publicly.")
 
         assert (
             quant_config is not None
@@ -1086,3 +1083,7 @@ class KitchenSpecProvider(BackendSpecProvider):
             return SequentialMLP, MLPSubmodules(
                 linear_fc1=KitchenColumnParallelLinear, linear_fc2=KitchenRowParallelLinear
             )
+
+    def activation_func(self) -> type:
+        """Which module to use for activation function"""
+        return None

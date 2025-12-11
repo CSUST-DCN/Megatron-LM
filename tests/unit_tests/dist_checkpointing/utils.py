@@ -1,3 +1,4 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from functools import partial
 from typing import Any, Callable, Tuple, Union
 from unittest import mock
@@ -24,6 +25,11 @@ NUM_ATTENTION_HEADS = 8
 def initialize_gpt_model(
     pre_process=True, post_process=True, seed=0, use_glu=True, **config_kwargs
 ):
+    # These kwargs are passed through training.get_model for model construction,
+    # but are not part of TransformerConfig; strip them before building config.
+    config_kwargs.pop("pg_collection", None)
+    config_kwargs.pop("config", None)
+
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
@@ -32,6 +38,7 @@ def initialize_gpt_model(
         hidden_size=HIDDEN_SIZE,
         num_attention_heads=NUM_ATTENTION_HEADS,
         use_cpu_initialization=True,
+        bf16=True,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs, gated_linear_unit=use_glu)
@@ -44,7 +51,6 @@ def initialize_gpt_model(
         post_process=post_process,
     )
 
-    model.bfloat16()
     with torch.no_grad():
         for p in model.parameters():
             p.random_()
@@ -61,6 +67,11 @@ def initialize_moe_model(
     use_grouped_mlp=False,
     **config_kwargs,
 ):
+    # These kwargs are passed through training.get_model for model construction,
+    # but are not part of TransformerConfig; strip them before building config.
+    config_kwargs.pop("pg_collection", None)
+    config_kwargs.pop("config", None)
+
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
     expert_num = 8
@@ -151,6 +162,10 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.hidden_size = HIDDEN_SIZE
     args.num_attention_heads = NUM_ATTENTION_HEADS
     args.ckpt_step = None
+    args.use_megatron_fsdp = False
+    args.dist_ckpt_save_pre_mcore_014 = False
+    args.dist_ckpt_optim_fully_reshardable = False
+    args.distrib_optim_fully_reshardable_mem_efficient = False
 
 
 def setup_model_and_optimizer(
@@ -160,7 +175,6 @@ def setup_model_and_optimizer(
     initialize_fn=initialize_gpt_model,
     bf16=True,
     dist_opt=True,
-    use_custom_fsdp=False,
     data_parallel_sharding_strategy="optim_grads_params",
 ):
     mock_args = parse_args(ignore_unknown_args=True)
