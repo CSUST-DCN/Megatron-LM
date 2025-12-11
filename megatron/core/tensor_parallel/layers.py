@@ -19,10 +19,11 @@ import math
 import torch.nn.init as init
 from torch.cuda.amp import custom_bwd, custom_fwd
 ##add
-mode = "tensor" # channel_tensor  tensor  tile_block channel tile
+mode = "channel" # channel tensor tile channel_tensor  tile_block   ###block
 sr = True
-int8_pad = True
+int8_pad = False
 clamp_outlier = False #False  #if gpc.config.clamp_outlier:
+
 
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
@@ -59,26 +60,32 @@ from .mappings import (
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility
 ##add
-# from .int8 import per_row_quantize_int8, per_col_quantize_int8, per_tensor_quantize_int8, per_token_scaled_int8_mm
+from .quant_kernel_sr import (
+    per_tensor_quantize_int8_triton,
+    per_row_quantize_int8_triton,
+    per_col_quantize_int8_triton,
+    per_group_row_quantize_int8_triton,
+    per_group_col_quantize_int8_triton,
+    per_block_quantize_int8_triton,
+    per_tensor_scaled_int8_mm_triton,
+    per_channel_scaled_int8_mm_triton,
+    per_group_scaled_int8_mm_triton,
+    per_block_scaled_int8_mm_triton,
+    per_token_tensor_scaled_int8_mm_triton,
+    per_tensor_token_scaled_int8_mm_triton,
+    per_rowgroup_block_scaled_int8_mm_triton,
 
-# from .int8copy import (
-#     per_block_quantize_int8,
-#     per_block_scaled_int8_mm,
-#     per_col_quantize_int8,
-#     per_group_col_quantize_int8,
-#     per_group_row_quantize_int8,
-#     # per_group_scaled_int8_mm,
-#     per_row_quantize_int8,
-#     # per_rowgroup_block_scaled_int8_mm,
-#     per_tensor_quantize_int8,
-#     per_tensor_scaled_int8_mm,
-#     per_tensor_token_scaled_int8_mm,
-#     per_token_tensor_scaled_int8_mm,
-#     clamp_outliers,
-#     _select_int8_ops,
-#     _quantize_int8,
-#     int8_gemm,
-# )
+    # per_row_quantize_int8_triton_optimated,
+    # per_col_quantize_int8_triton_optimated,
+    # per_channel_scaled_int8_mm_triton_optimated,
+    # per_row_quantize_int8_triton_optimized,
+    # per_token_tensor_scaled_int8_mm_triton_optimized,
+
+    # per_group_row_quantize_int8_triton_optimized,
+    # per_block_quantize_int8_triton_optimized,
+    # per_rowgroup_block_scaled_int8_mm_triton_optimized,
+
+)
 
 
 from .int8 import (
@@ -98,11 +105,42 @@ from .int8 import (
     _select_int8_ops,
     _quantize_int8,
     _torch_linear_forward_op,
+    # per_tensor_quantize_int8_triton, per_tensor_quantize_int8_triton, per_tensor_scaled_int8_mm_triton,
 )
 
 
-# import per_row_quantize_int8, per_col_quantize_int8, per_tensor_quantize_int8, per_token_scaled_int8_mm
+def _quantize_int8_triton(input, weight, mode="tensor", sr=False):
+    if mode == "tensor":
+        a_int8, a_scale = per_tensor_quantize_int8_triton(input, sr=sr)
+        b_int8, b_scale = per_tensor_quantize_int8_triton(weight, sr=sr)
+        int8_mm = per_tensor_scaled_int8_mm_triton
+    elif mode == "channel":
+        a_int8, a_scale = per_row_quantize_int8_triton(input, sr=sr)
+        b_int8, b_scale = per_col_quantize_int8_triton(weight, sr=sr)
+        int8_mm = per_channel_scaled_int8_mm_triton
+    elif mode == "channel_tensor":
+        a_int8, a_scale = per_row_quantize_int8_triton(input, sr=sr)
+        b_int8, b_scale = per_tensor_quantize_int8_triton(weight, sr=sr)
+        int8_mm = per_token_tensor_scaled_int8_mm_triton
+    elif mode == "tile":
+        group_size = 128  # 可配置
+        a_int8, a_scale = per_group_row_quantize_int8_triton(input, group_size=group_size, sr=sr)
+        b_int8, b_scale = per_group_col_quantize_int8_triton(weight, group_size=group_size, sr=sr)
+        int8_mm = per_group_scaled_int8_mm_triton
+    elif mode == "tile_block":
+        group_size = 128
+        a_int8, a_scale = per_group_row_quantize_int8_triton(input, group_size=group_size, sr=sr)
+        b_int8, b_scale = per_block_quantize_int8_triton(weight, tile=(group_size, group_size), sr=sr)
+        int8_mm = per_rowgroup_block_scaled_int8_mm_triton
+    elif mode == "block":
+        group_size = 128
+        a_int8, a_scale = per_block_quantize_int8_triton(input, tile=(group_size, group_size), sr=sr)
+        b_int8, b_scale = per_block_quantize_int8_triton(weight, tile=(group_size, group_size), sr=sr)
+        int8_mm = per_block_scaled_int8_mm_triton
 
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+    return a_int8, b_int8, a_scale, b_scale, int8_mm
 
 
 _grad_accum_fusion_available = True
@@ -113,7 +151,6 @@ except ImportError:
 
 try:
     import transformer_engine  # pylint: disable=unused-import
-    from transformer_engine.pytorch.module.base import get_dummy_wgrad
 
     HAVE_TE = True
 except ImportError:
@@ -195,7 +232,8 @@ def _initialize_affine_weight_gpu(weight, init_method, partition_dim, stride=1, 
     set_tensor_model_parallel_attributes(
         tensor=weight, is_parallel=True, dim=partition_dim, stride=stride
     )
-
+    # print(1111)
+    # print(weight.dtype)
     if not is_expert:
         with get_cuda_rng_tracker().fork():
             init_method(weight)
@@ -214,6 +252,7 @@ def _initialize_affine_weight_cpu(
     stride=1,
     return_master_weight=False,
     *,
+    # params_dtype=torch.int8,
     params_dtype=torch.float32,
     rank=None,
     world_size=None,
@@ -317,6 +356,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                     self.num_embeddings_per_partition,
                     self.embedding_dim,
                     device=torch.cuda.current_device(),
+                    # dtype=torch.int8,
                     dtype=config.params_dtype,
                 )
             )
@@ -526,6 +566,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         else:
             main_grad = None
         ctx.save_for_backward(input, weight)
+
         # We can't save main_grad in save_for_backward as this module would be
         # reused across layers like MTP logits. So, to prevent in-place modification
         # checks we save the tensor in ctx.
@@ -548,23 +589,23 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
             dist_all_gather_func(all_gather_buffer, input, group=tp_group)
             total_input = all_gather_buffer
-            # _input = all_gather_buffer
         else:
             total_input = input
-            # _input = input
 ##add
         # print(f"total_input shape: {total_input.shape}, weight shape: {weight.shape}")
-        
+
         # export USR_INT8_QUANT=1
         if os.getenv("USR_INT8_QUANT", "0") == "1":
             ##add date 8-3
+            # print(mode)
+            # print("Triton 1111111111111111111")
+
             dtype = total_input.dtype
             org_shape = total_input.shape
-            # print(_input.shape)
             total_input = total_input.reshape(-1, org_shape[-1])
-            # print(11111111111111)
-            # print(_input.shape)
-            # print(weight.shape)
+
+            # print("forward")
+            # print(weight.dtype)
             # print(weight.t().shape)
             # grad_output = grad_output.reshape(-1, org_shape[-1])
             #mode = gpc.config.int8_mode
@@ -572,26 +613,81 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             # int8_pad = True
             # clamp_outlier = True  #if gpc.config.clamp_outlier:
             # # _input = total_input
-            if clamp_outlier:
-                input_name = getattr(total_input, "global_name", None)
-                total_input, total_input_outliers = clamp_outliers(total_input)
-                if input_name is not None:
-                    setattr(total_input, "global_name", input_name)
 
-            _, _, int8_mm = _select_int8_ops(mode)
-            _input_int8, weight_t_int8, input_scale, weight_t_scale = _quantize_int8(total_input, weight, sr=sr, mode=mode)
+            # if clamp_outlier:
+            #     input_name = getattr(total_input, "global_name", None)
+            #     total_input, total_input_outliers = clamp_outliers(total_input)
+            #     if input_name is not None:
+            #         setattr(total_input, "global_name", input_name)
+
+            # python实现
+            # _, _, int8_mm = _select_int8_ops(mode)
+            # _input_int8, weight_t_int8, input_scale, weight_t_scale = _quantize_int8(total_input, weight, sr=sr, mode=mode)
+            # assert _input_int8.dtype == torch.int8 and weight_t_int8.dtype == torch.int8
+            # output = int8_mm(_input_int8, weight_t_int8, input_scale, weight_t_scale).to(dtype)
+
+            
+            # output = per_rowgroup_block_scaled_int8_mm_triton(_input_int8, weight_t_int8, input_scale, weight_t_scale).to(dtype)
+
+            # T_input_int8, Tweight_t_int8, Tinput_scale, Tweight_t_scale, int8_mm = _quantize_int8_triton(
+            #     total_input, weight.t(), sr=sr, mode=mode
+            # )
+            # print(_input_int8)
+            # print(weight_t_int8)
+            # print(weight_t_scale*127.0)
+
+
+            # print(1111111111111)
+            # print(T_input_int8)
+            # print(Tweight_t_int8)
+            # print(Tweight_t_scale)
+
+            #triton实现
+            _input_int8, weight_t_int8, input_scale, weight_t_scale, int8_mm = _quantize_int8_triton(
+                total_input, weight.t(), sr=sr, mode=mode
+            )
             assert _input_int8.dtype == torch.int8 and weight_t_int8.dtype == torch.int8
-            output = int8_mm(_input_int8, weight_t_int8, input_scale, weight_t_scale).to(dtype)
+            output = int8_mm(_input_int8, weight_t_int8, input_scale/127.0, weight_t_scale/127.0).to(dtype)
+        
 
-            if clamp_outlier:
-                outlier_output = _torch_linear_forward_op(total_input_outliers, weight)
-                # outlier_output = torch.matmul(total_input_outliers, weight.t())
-                output += outlier_output
+            # _input_int8, input_scale = per_group_row_quantize_int8_triton(total_input, sr=sr)
+            # weight_t_int8, weight_t_scale = per_block_quantize_int8(weight.t(), sr=sr)
+            # assert _input_int8.dtype == torch.int8 and weight_t_int8.dtype == torch.int8
+            # output = per_rowgroup_block_scaled_int8_mm(_input_int8, weight_t_int8, input_scale/127.0, weight_t_scale/127.0).to(dtype)
 
-            if int8_pad:
-                m, _ = total_input.shape
-                _, n = weight.t().shape
-                output = output[:m, :n]            
+
+            
+            # output = per_token_tensor_scaled_int8_mm_triton(_input_int8, weight_t_int8, input_scale/127.0, weight_t_scale/127.0).to(dtype)
+            # output = per_block_scaled_int8_mm(_input_int8, weight_t_int8, input_scale, weight_t_scale).to(dtype)
+            # output = per_block_scaled_int8_mm_triton(_input_int8, weight_t_int8, input_scale, weight_t_scale).to(dtype)
+
+
+            # output1 = per_channel_scaled_int8_mm_triton(T_input_int8, Tweight_t_int8, Tinput_scale/127.0, Tweight_t_scale/127.0).to(dtype)
+            # output = per_group_scaled_int8_mm_triton(_input_int8, Tweight_t_int8, input_scale, Tweight_t_scale/127.0).to(dtype)
+
+
+
+            # print("Triton 66666666666666666666")
+            # abs_max_inv = (1.0 / Tweight_t_scale).to(torch.float32)
+            # print(abs_max_inv)
+
+
+            # output = torch.matmul(total_input, weight.t())
+
+
+
+            # print(_input_int8, weight_t_int8)
+            # output = per_tensor_scaled_int8_mm_triton(_input_int8, weight_t_int8, input_scale, weight_t_scale).to(dtype)
+
+            # if clamp_outlier:
+            #     outlier_output = _torch_linear_forward_op(total_input_outliers, weight)
+            #     # outlier_output = torch.matmul(total_input_outliers, weight.t())
+            #     output += outlier_output
+
+            # if int8_pad:
+            #     m, _ = total_input.shape
+            #     _, n = weight.t().shape
+            #     output = output[:m, :n]            
 
             # dtype = total_input.dtype
             # org_shape = total_input.shape
@@ -600,12 +696,41 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             # weight_t, weight_scale_t = per_tensor_quantize_int8(weight.t())
             # output = per_token_scaled_int8_mm(total_input, weight_t, total_input_scale, weight_scale_t, dtype)
             # print(_input.shape)
+
+            # print(output.shape)
+
+
+
             output = output.view(org_shape[0], org_shape[1], weight_t_int8.shape[1])
+
+
+
+            # output2 = output2.view(org_shape[0], org_shape[1], weight_t_int8.shape[1])
+            # print(output.shape)
             # print(222222222222222222)
             # print(_input.shape)
+            # output2 = torch.matmul(total_input, weight.t())
 
+
+
+            # print(f"forward error1: {torch.abs(output - output1).mean().item()}")
+            # print(output)
+
+            
+            
+
+            # print(output)
+            # print(output2)
+            # print(output3)
+
+
+
+            # print(f"\nforward error1: {torch.abs(output - output1).mean().item()}\n")
+            # ctx.save_for_backward(_input_int8, weight, input_scale)  # 替换原来的 ctx.save_for_backward(input, weight)
  
         else:##add
+            # ctx.save_for_backward(input, weight)
+            # ctx.quantized_input = False
             output = torch.matmul(total_input, weight.t())
         if bias is not None:
             output = output + bias
@@ -616,6 +741,9 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Backward."""
         input, weight = ctx.saved_tensors
+        # input, weight, input_scale = ctx.saved_tensors ###modify
+        # print("input_scale111")
+        # print(input_scale)
         dtype = grad_output.dtype ##add
         main_grad = ctx.main_grad
         use_bias = ctx.use_bias
@@ -648,21 +776,16 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
                 # gather is scheduled before the input gradient computation
                 total_input = all_gather_buffer
-                # _input = all_gather_buffer
             else:
                 total_input = input
-                # _input = input
 ##add
         if os.getenv("USR_INT8_QUANT", "0") == "1":
-            ##add date 8-3
+            #add date 8-3
             dtype = total_input.dtype
             # input_shape = total_input.shape
             org_shape = grad_output.shape
-            # print(111111111111111)
-            # print(_input.dim())
-            # total_input = total_input.reshape(-1, input_shape[-1])  ###注释掉好像会报错
             grad_output = grad_output.reshape(-1, org_shape[-1])
-            # print(222222222222222)
+
             # print(_input.dim())
             # print(total_input.shape)
             # print(grad_output.shape)
@@ -673,39 +796,90 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             # int8_pad = True
             # clamp_outlier = True  #if gpc.config.clamp_outlier:
             # # _input = total_input
-            if clamp_outlier:
-                input_name = getattr(grad_output, "global_name", None)
-                grad_output, grad_output_outliers = clamp_outliers(grad_output)
-                if input_name is not None:
-                    setattr(grad_output, "global_name", input_name)
+
 
             # if clamp_outlier:
-            #     input_name = getattr(weight, "global_name", None)
-            #     weight, weight_outliers = clamp_outliers(weight)
+            #     input_name = getattr(grad_output, "global_name", None)
+            #     grad_output, grad_output_outliers = clamp_outliers(grad_output)
             #     if input_name is not None:
-            #         setattr(weight, "global_name", input_name)
-
-            _, _, int8_mm = _select_int8_ops(mode)
+            #         setattr(grad_output, "global_name", input_name)
 
 
+
+            # _, _, int8_mm = _select_int8_ops(mode)
             # grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale = _quantize_int8(
-            #     grad_output.t(), _input, mode=mode, trans_b=False
-            # )             ####是否这里grad_output不需要转置
-            grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale = _quantize_int8(
-                grad_output, weight, sr=sr, mode=mode, trans_b=False
+            #     grad_output, weight, sr=sr, mode=mode, trans_b=False
+            # )
+            # assert _input_int8.dtype == torch.int8 and grad_output_t_int8.dtype == torch.int8
+            # grad_input = int8_mm(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+
+
+            
+            # grad_input = per_rowgroup_block_scaled_int8_mm_triton(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+
+
+
+            # Tgrad_output_t_int8, T_input_int8, Tgrad_output_t_scale, Tinput_scale, int8_mm = _quantize_int8_triton(
+            #     grad_output, weight, sr=sr, mode=mode
+            # )
+            # print(grad_output)
+            
+            # print("triton量化：")
+            grad_output_t_int8, _weight_int8, grad_output_t_scale, weight_scale, int8_mm = _quantize_int8_triton(
+                grad_output, weight, sr=sr, mode=mode
             )
-            assert _input_int8.dtype == torch.int8 and grad_output_t_int8.dtype == torch.int8
-            # grad_weight = int8_mm(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
-            grad_input = int8_mm(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+            assert _weight_int8.dtype == torch.int8 and grad_output_t_int8.dtype == torch.int8
+            grad_input = int8_mm(grad_output_t_int8, _weight_int8, grad_output_t_scale/127.0, weight_scale/127.0).to(dtype)
+            
+            # print(11111111111111)
+            # print("grad_output")
+            # print(grad_output)
+            # print(grad_output_t_int8)
+            # print(grad_output_t_scale)
 
-            if clamp_outlier:
-                outlier_output = torch.matmul(grad_output_outliers, weight)
-                grad_input += outlier_output
+            # print("weight")
+            # print(weight)
+            # print(_input_int8)
+            # print(input_scale)
+            # print(22222222222222)
 
-            if int8_pad:
-                m, _ = grad_output.shape
-                _, n = weight.shape
-                grad_input = grad_input[:m, :n]
+            # grad_output_t_int8, grad_output_t_scale = per_group_row_quantize_int8_triton(grad_output, sr=sr)
+            # _input_int8, input_scale = per_block_quantize_int8(weight, sr=sr)
+            # assert _input_int8.dtype == torch.int8 and grad_output_t_int8.dtype == torch.int8
+            # grad_input = per_rowgroup_block_scaled_int8_mm(grad_output_t_int8, _input_int8, grad_output_t_scale/127.0, input_scale/127.0).to(dtype)
+            
+            # grad_input = per_token_tensor_scaled_int8_mm_triton(grad_output_t_int8, _input_int8, grad_output_t_scale/127.0, input_scale/127.0).to(dtype)
+            # grad_input = per_token_tensor_scaled_int8_mm_triton(grad_output_t_int8, _input_int8, grad_output_t_scale/127.0, input_scale/127.0).to(dtype)
+            # grad_input = per_block_scaled_int8_mm(grad_output_t_int8, _input_int8, grad_output_t_scale/127.0, input_scale/127.0).to(dtype)
+            # grad_input = per_block_scaled_int8_mm_triton(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+            # grad_input1 = per_channel_scaled_int8_mm_triton(grad_output_t_int8, _input_int8, grad_output_t_scale/127.0, input_scale/127.0).to(dtype)
+            
+            
+            # grad_input = per_tensor_scaled_int8_mm_triton(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+            # grad_input = per_group_scaled_int8_mm_triton(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+
+            # print(f"forward error2: {torch.abs(grad_input - grad_input1).mean().item()}")
+
+            # grad_input1 = per_group_scaled_int8_mm(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+            # grad_input2 = per_group_scaled_int8_mm(Tgrad_output_t_int8, T_input_int8, Tgrad_output_t_scale/127.0, Tinput_scale/127.0).to(dtype)
+
+            # grad_input3 = per_group_scaled_int8_mm(Tgrad_output_t_int8, _input_int8, Tgrad_output_t_scale/127.0, input_scale).to(dtype)
+            # grad_input4 = per_group_scaled_int8_mm(grad_output_t_int8, T_input_int8, grad_output_t_scale, Tinput_scale/127.0).to(dtype)
+            # grad_input = grad_output.matmul(weight)
+
+            # print(f"\nforward error1: {torch.abs(grad_input - grad_input1).mean().item()}")
+            # print(f"forward error2: {torch.abs(grad_input - grad_input2).mean().item()}")
+            # print(f"forward error3: {torch.abs(grad_input - grad_input3).mean().item()}")
+            # print(f"forward error4: {torch.abs(grad_input - grad_input4).mean().item()}\n")
+
+            # if clamp_outlier:
+            #     outlier_output = torch.matmul(grad_output_outliers, weight)
+            #     grad_input += outlier_output
+
+            # if int8_pad:
+            #     m, _ = grad_output.shape
+            #     _, n = weight.shape
+            #     grad_input = grad_input[:m, :n]
 
 
             # org_shape = grad_output.shape
@@ -716,11 +890,23 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             # grad_input = per_token_scaled_int8_mm(grad_output_r, weight, grad_output_scale_r, weight_scale, torch.float32)
             # print(33333333333333)
             # print(grad_weight.shape)
-            grad_input = grad_input.view(org_shape[0], org_shape[1], _input_int8.shape[1])
+
+
+            grad_input = grad_input.view(org_shape[0], org_shape[1], _weight_int8.shape[1])
+            # grad_input = grad_input.view(org_shape[0], org_shape[1], weight.shape[1])
+
+
+
+
             # print(44444444444444)
             # print(grad_input.shape)
+
+            # grad_input1 = grad_output.matmul(weight)
+            # print(f"backward error1: {torch.abs(grad_input - grad_input1).mean().item()}")
+            # print(grad_input)
         
         else:##add
+            # grad_input = grad_output.matmul(weight.t())
             grad_input = grad_output.matmul(weight)
 
         if ctx.sequence_parallel and wgrad_compute:
@@ -753,23 +939,16 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.gradient_accumulation_fusion:
             if wgrad_compute:
-                # In case of Megatron-FSDP, need to create main grad buffers in-place
-                if hasattr(weight, "__fsdp_param__"):
-                    weight.main_grad = weight.get_main_grad()
-                    torch.matmul(grad_output.t(), total_input, out=weight.main_grad)
+                if weight.main_grad.dtype == torch.float32:
+                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+                        total_input, grad_output, weight.main_grad
+                    )
+                elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
+                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+                        total_input, grad_output, weight.main_grad
+                    )
                 else:
-                    if weight.main_grad.dtype == torch.float32:
-                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
-                            total_input, grad_output, weight.main_grad
-                        )
-                    elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
-                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
-                            total_input, grad_output, weight.main_grad
-                        )
-                    else:
-                        raise RuntimeError(
-                            "Unsupported gradient type for gradient accumulation fusion"
-                        )
+                    raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
 
             if hasattr(weight, "grad_added_to_main_grad"):
                 # When overlap_grad_reduce is True, need to ensure that backward hooks
@@ -777,84 +956,136 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # dummy grad_weight tensor to prevent backward hooks from being run
                 # in a background thread.
                 if getattr(weight, "zero_out_wgrad", False):
-                    if HAVE_TE:
-                        # get_dummy_wgrad function in TE enables reuse of single dummy wgrad buffer
-                        # across different layers/microbatches. The function accepts shape as list.
-                        grad_weight = get_dummy_wgrad(
-                            list(weight.main_grad.shape), input.dtype, zero=True
-                        )
-                    else:
-                        grad_weight = torch.zeros(
-                            weight.main_grad.shape,
-                            dtype=input.dtype,
-                            device=torch.cuda.current_device(),
-                            requires_grad=False,
-                        )
+                    grad_weight = torch.zeros(
+                        weight.main_grad.shape,
+                        dtype=input.dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
                 else:
-                    if HAVE_TE:
-                        grad_weight = get_dummy_wgrad(list(weight.main_grad.shape), input.dtype)
-                    else:
-                        grad_weight = torch.empty(
-                            weight.main_grad.shape,
-                            dtype=input.dtype,
-                            device=torch.cuda.current_device(),
-                            requires_grad=False,
-                        )
+                    grad_weight = torch.empty(
+                        weight.main_grad.shape,
+                        dtype=input.dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
                 weight.grad_added_to_main_grad = True
             else:
                 grad_weight = None
         else:
 ##add
             if os.getenv("USR_INT8_QUANT", "0") == "1":
-                # grad_output_t, grad_output_scale_t = per_row_quantize_int8(grad_output.t())
-                # total_input_c, total_input_scale_c = per_col_quantize_int8(total_input.reshape(-1, total_input.shape[-1]))
-                # grad_weight = per_token_scaled_int8_mm(grad_output_t, total_input_c, grad_output_scale_t, total_input_scale_c, dtype)
-            
-            
-            
                 ##add date 8-3
+
                 dtype = total_input.dtype
                 input_shape = total_input.shape
                 org_shape = grad_output.shape
-                total_input = total_input.reshape(-1, input_shape[-1])
+                total_input = total_input.reshape(- 1, input_shape[-1]) #注释
+
+
+                # print(grad_output.t())
+                # print(total_input)
+                # print(0)
+                # print(333333333333)
                 # grad_output = grad_output.reshape(-1, org_shape[-1])
                 #mode = gpc.config.int8_mode
                 # mode = "channel_tensor" # channel_tensor  tensor  tile_block
                 # int8_pad = True 
                 # clamp_outlier = True  #if gpc.config.clamp_outlier:
                 # # _input = total_input
-                if clamp_outlier:
-                    input_name = getattr(total_input, "global_name", None)
-                    total_input, total_input_outliers = clamp_outliers(total_input)
-                    if input_name is not None:
-                        setattr(total_input, "global_name", input_name)
 
-                _, _, int8_mm = _select_int8_ops(mode)
-                grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale = _quantize_int8(
-                    grad_output.t(), total_input, sr=sr, mode=mode, trans_b=False
+                
+                # if clamp_outlier:
+                #     input_name = getattr(total_input, "global_name", None)
+                #     total_input, total_input_outliers = clamp_outliers(total_input)
+                #     if input_name is not None:
+                #         setattr(total_input, "global_name", input_name)
+
+                # _, _, int8_mm = _select_int8_ops(mode)
+                # grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale = _quantize_int8(
+                #     grad_output.t(), total_input, sr=sr, mode=mode, trans_b=False
+                # )
+                # assert _input_int8.dtype == torch.int8 and grad_output_t_int8.dtype == torch.int8
+                # grad_weight = int8_mm(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+
+                
+                # grad_weight = per_rowgroup_block_scaled_int8_mm_triton(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+
+
+                # grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale, int8_mm = _quantize_int8_triton(
+                #     grad_output.t(), total_input, sr=sr, mode=mode
+                # )
+
+                #triton
+                grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale, int8_mm = _quantize_int8_triton(
+                    grad_output.t(), total_input, sr=sr, mode=mode
                 )
                 assert _input_int8.dtype == torch.int8 and grad_output_t_int8.dtype == torch.int8
-                grad_weight = int8_mm(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+                grad_weight = int8_mm(grad_output_t_int8, _input_int8, grad_output_t_scale/127.0, input_scale/127.0).to(dtype)
+
+                # print("total_input222")
+                # print(total_input)
+                # print(total_input.shape)
+                # print("input_scale222")
+                # print(input_scale.shape) 
+
+                # grad_output_t_int8, grad_output_t_scale = per_row_quantize_int8_triton(grad_output.t(), sr=sr)
+                # # total_input,input_scale
+                # # total_input, input_scale = per_tensor_quantize_int8_triton(total_input, sr=sr)
+                # assert total_input.dtype == torch.int8 and grad_output_t_int8.dtype == torch.int8
+                # grad_weight = per_channel_scaled_int8_mm_triton(grad_output_t_int8, total_input, grad_output_t_scale/127.0, input_scale/127.0).to(dtype)
+
+                # input, weight, input_scale = ctx.saved_tensors
+
+
+                # print(3333333333333)
+                # grad_weight = per_rowgroup_block_scaled_int8_mm(grad_output_t_int8, _input_int8, grad_output_t_scale/127.0, input_scale/127.0).to(dtype)
+                # grad_output_t_int8, grad_output_t_scale = per_group_row_quantize_int8_triton(grad_output.t(), sr=sr)
+                # _input_int8, input_scale = per_block_quantize_int8(total_input, sr=sr)
+                # assert _input_int8.dtype == torch.int8 and grad_output_t_int8.dtype == torch.int8
+                # grad_weight = per_rowgroup_block_scaled_int8_mm_triton(grad_output_t_int8, _input_int8, grad_output_t_scale/127.0, input_scale).to(dtype)
+                
+                # grad_weight = per_block_scaled_int8_mm(grad_output_t_int8, _input_int8, grad_output_t_scale/127.0, input_scale/127.0).to(dtype)
+                # grad_weight = per_block_scaled_int8_mm_triton(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+
+                # print(grad_output_t_int8)
+                # print(grad_output_t_scale)
+                # print(111111111)
+                # print(_input_int8)
+                # print(input_scale)
+                # print(222222222)
+
+                # grad_weight = grad_output.t().matmul(total_input)
+                # grad_weight = per_block_scaled_int8_mm_triton(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+                
+                # grad_weight1 = per_channel_scaled_int8_mm_triton(grad_output_t_int8, _input_int8, grad_output_t_scale/127.0, input_scale/127.0).to(dtype)
+                # grad_weight = per_group_scaled_int8_mm_triton(grad_output_t_int8, _input_int8, grad_output_t_scale, input_scale).to(dtype)
+                
 
                 # _input_int8, weight_t_int8, input_scale, weight_t_scale = _quantize_int8(_input, weight, mode=mode)
                 # assert _input_int8.dtype == torch.int8 and weight_t_int8.dtype == torch.int8
                 # output = int8_mm(_input_int8, weight_t_int8, input_scale, weight_t_scale).to(dtype)
 
-                if clamp_outlier:
-                    outlier_output = torch.matmul(grad_output.t(), total_input_outliers)
-                    grad_weight += outlier_output
+                # if clamp_outlier:
+                #     outlier_output = torch.matmul(grad_output.t(), total_input_outliers)
+                #     grad_weight += outlier_output
 
-                if int8_pad:
-                    m, _ = grad_output.t().shape
-                    _, n = total_input.shape
-                    grad_weight = grad_weight[:m, :n]
+                # if int8_pad:
+                #     m, _ = grad_output.t().shape
+                #     _, n = total_input.shape
+                #     grad_weight = grad_weight[:m, :n]
             
                 # grad_weight = grad_weight.view(org_shape[0], org_shape[1], _input_int8.shape[1])
 
+                # grad_weight = grad_output.t().matmul(total_input)
+                # print(f"backward error1: {torch.abs(grad_weight - grad_weight1).mean().item()}")
+                # print(grad_weight)
+                # print(f"backward error2: {torch.abs(grad_weight - grad_weight2).mean().item()}")
 
 
             
             else:##add
+                # grad_weight = total_input.t().matmul(grad_output)
                 grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
@@ -895,7 +1126,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     the weight gradients.
 
     In the case of sequence parallelism, the reduce scatter of the
-    input gradients is done asynchronously with the calculation of the
+    input gradients is done asynchronously with the calcluation of the
     weight gradients.
 
     Use of this module requires that the environment variable
@@ -1017,7 +1248,7 @@ class ColumnParallelLinear(torch.nn.Module):
             returns the master weights used for initialization.
         skip_bias_add:
             If True, do not add the bias term, instead return it to be added by the
-            caller. This enables performance optimizations where bias can be fused with other
+            caller. This enables performance optimations where bias can be fused with other
             elementwise operations.
         skip_weight_param_allocation:
             If True, weight parameter is not allocated and must be passed
@@ -1115,6 +1346,7 @@ class ColumnParallelLinear(torch.nn.Module):
                         self.output_size_per_partition,
                         self.input_size,
                         device=torch.cuda.current_device(),
+                        # dtype=torch.int8,
                         dtype=config.params_dtype,
                     )
                 )
@@ -1181,18 +1413,14 @@ class ColumnParallelLinear(torch.nn.Module):
                 "`allreduce_dgrad` and `sequence_parallel` cannot be enabled at the same time."
             )
 
+        self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
+
         # Hook adding a default empty _extra_state for state dict
         self._register_load_state_dict_pre_hook(
             lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(
                 f"{prefix}_extra_state"
             )
         )
-
-    def _forward_impl(self, input, weight, *args, **kwargs):
-        if not weight.requires_grad:
-            return linear_with_frozen_weight(input, weight, *args, **kwargs)
-        else:
-            return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
 
     def forward(
         self,
@@ -1257,6 +1485,11 @@ class ColumnParallelLinear(torch.nn.Module):
                 self.embedding_activation_buffer.append(input_parallel)
 
         # Matrix multiply.
+        if not weight.requires_grad:
+            self._forward_impl = linear_with_frozen_weight
+        else:
+            self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
+
         allreduce_dgrad = False if self.explicit_expert_comm else self.allreduce_dgrad
 
         if self.config._cpu_offloading_context is not None:
@@ -1347,7 +1580,7 @@ class RowParallelLinear(torch.nn.Module):
             used for initialization.
         skip_bias_add:
             If True, do not add the bias term, instead return it to be added by the
-            caller. This enables performance optimizations where bias can be fused with other
+            caller. This enables performance optimations where bias can be fused with other
             elementwise operations.
         is_expert:
             If True, the layer is treated as an MoE expert layer
@@ -1432,6 +1665,7 @@ class RowParallelLinear(torch.nn.Module):
                     self.output_size,
                     self.input_size_per_partition,
                     device=torch.cuda.current_device(),
+                    # dtype=torch.int8,
                     dtype=config.params_dtype,
                 )
             )
@@ -1466,18 +1700,14 @@ class RowParallelLinear(torch.nn.Module):
         else:
             self.register_parameter("bias", None)
 
+        self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
+
         # Hook adding a default empty _extra_state for state dict
         self._register_load_state_dict_pre_hook(
             lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(
                 f"{prefix}_extra_state"
             )
         )
-
-    def _forward_impl(self, input, weight, *args, **kwargs):
-        if not weight.requires_grad:
-            return linear_with_frozen_weight(input, weight, *args, **kwargs)
-        else:
-            return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
 
     def forward(self, input_):
         """Forward of RowParallelLinear
@@ -1497,6 +1727,11 @@ class RowParallelLinear(torch.nn.Module):
             assert not self.sequence_parallel
             input_parallel = scatter_to_tensor_model_parallel_region(input_, group=self.tp_group)
         # Matrix multiply.
+        if not self.weight.requires_grad:
+            self._forward_impl = linear_with_frozen_weight
+        else:
+            self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
+
         allreduce_dgrad = False
 
         if self.config._cpu_offloading_context is not None:
